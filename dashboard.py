@@ -33,7 +33,7 @@ def safe_log(message: str):
 # -----------------------------------------------------------------------------
 # CONSTANTS & CONFIGURATION
 # -----------------------------------------------------------------------------
-BACKEND_BASE_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+BACKEND_BASE_URL = os.getenv("BACKEND_URL", "https://cartsaver-ai.onrender.com")
 ACCENT_COLOR = "#6938EF"
 COLOR_RECOVERED = "#12B76A"
 COLOR_UNRECOVERED = "#667085"
