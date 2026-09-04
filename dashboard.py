@@ -242,12 +242,11 @@ div.stButton > button[kind="primary"]:hover {{
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# ROBUST API CLIENT WITH STREAMLIT DATA CACHING (ttl=30s)
+# ROBUST API CLIENT
 # Wraps every request in a try/except block, checks response.status_code == 200,
 # and returns (parsed_json, None) on success or (None, error_str) on failure.
-# Caches GET requests with @st.cache_data(ttl=30) to eliminate redundant calls.
 # -----------------------------------------------------------------------------
-def _raw_fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+def fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
     url = f"{BACKEND_BASE_URL}{endpoint}"
     try:
         if method == "GET":
@@ -268,54 +267,6 @@ def _raw_fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str
         return None, f"Unable to reach CartSaver AI backend at {BACKEND_BASE_URL}. Please verify the FastAPI service is running."
     except Exception as e:
         return None, f"Unexpected error during API call to {endpoint}: {e}"
-
-@st.cache_data(ttl=30)
-def fetch_analytics_summary() -> Tuple[Optional[Any], Optional[str]]:
-    """Fetch portfolio analytics summary with 30s TTL caching."""
-    return _raw_fetch_api("/analytics/summary")
-
-@st.cache_data(ttl=30)
-def fetch_carts(params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
-    """Fetch carts list with optional query filters and 30s TTL caching."""
-    return _raw_fetch_api("/carts", params=params)
-
-@st.cache_data(ttl=30)
-def fetch_audit_log(limit: int = 50, offset: int = 0) -> Tuple[Optional[Any], Optional[str]]:
-    """Fetch paginated audit log entries with 30s TTL caching."""
-    return _raw_fetch_api("/audit-log", params={"limit": limit, "offset": offset})
-
-@st.cache_data(ttl=30)
-def fetch_cart_detail(cart_id: str) -> Tuple[Optional[Any], Optional[str]]:
-    """Fetch individual cart details and escalation logs with 30s TTL caching."""
-    return _raw_fetch_api(f"/carts/{cart_id}")
-
-@st.cache_data(ttl=30)
-def _cached_get_api(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
-    """Fallback cached GET dispatcher with 30s TTL caching."""
-    return _raw_fetch_api(endpoint, method="GET", params=params)
-
-def fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Central API gateway:
-    - Routes GET calls (/analytics/summary, /carts, /audit-log, /carts/{id}) to 30s cached functions.
-    - Routes POST requests (e.g. recovery actions) live without caching.
-    """
-    if method == "GET":
-        if endpoint == "/analytics/summary":
-            return fetch_analytics_summary()
-        elif endpoint == "/carts":
-            return fetch_carts(params=params)
-        elif endpoint == "/audit-log":
-            limit = params.get("limit", 50) if params else 50
-            offset = params.get("offset", 0) if params else 0
-            return fetch_audit_log(limit=limit, offset=offset)
-        elif endpoint.startswith("/carts/"):
-            cid = endpoint.split("/carts/")[1]
-            return fetch_cart_detail(cid)
-        else:
-            return _cached_get_api(endpoint, params=params)
-    else:
-        return _raw_fetch_api(endpoint, method=method, json_data=json_data)
 
 # -----------------------------------------------------------------------------
 # SESSION STATE INITIALIZATION
@@ -502,7 +453,6 @@ if st.session_state.page == "Overview":
                     "text": success_msg
                 }
                 time.sleep(1.0)
-                st.cache_data.clear()
                 st.rerun()
 
     # Use summary fetched in header if available, otherwise fetch
@@ -570,7 +520,6 @@ if st.session_state.page == "Overview":
 
     # Chart 1: Bar chart of segment_breakdown (count per segment)
     with chart_col1:
-        st.markdown("<div class='cs-card'>", unsafe_allow_html=True)
         st.markdown("<div style='font-size: 15px; font-weight: 600; margin-bottom: 12px;'>Carts by Customer Segment</div>", unsafe_allow_html=True)
         
         if not summary_data or not isinstance(summary_data, dict) or "segment_breakdown" not in summary_data:
@@ -600,11 +549,9 @@ if st.session_state.page == "Overview":
                     height=280
                 )
                 st.plotly_chart(fig_seg, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
 
     # Chart 2: Bar chart of escalation_stage_breakdown
     with chart_col2:
-        st.markdown("<div class='cs-card'>", unsafe_allow_html=True)
         st.markdown("<div style='font-size: 15px; font-weight: 600; margin-bottom: 12px;'>Interventions by Escalation Stage</div>", unsafe_allow_html=True)
         
         if not summary_data or not isinstance(summary_data, dict) or "escalation_stage_breakdown" not in summary_data:
@@ -635,10 +582,10 @@ if st.session_state.page == "Overview":
                     height=280
                 )
                 st.plotly_chart(fig_stage, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
 
     # Chart 3: Donut chart of stopping_reason_breakdown / Agent Stopping Rules
-    st.markdown("<div class='cs-card'>", unsafe_allow_html=True)
     st.markdown("<div style='font-size: 15px; font-weight: 600; margin-bottom: 12px;'>Agent Stopping Rules Distribution</div>", unsafe_allow_html=True)
     
     # 1. Read stopping_reason_breakdown with fallback to alternative keys
@@ -790,7 +737,6 @@ if st.session_state.page == "Overview":
             for reason, count in normalized_stop_data.items()
         ])
         st.markdown(f"<div style='margin-top: 10px;'>{pills_html}</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1027,7 +973,6 @@ elif st.session_state.page == "Carts Explorer":
                                     "type": "info",
                                     "text": f"Attempt for {cname} executed at {stage}. Outcome: {outcome}."
                                 }
-                    st.cache_data.clear()
                     st.rerun()
 
             st.markdown("<div style='border-bottom: 1px solid rgba(102, 112, 133, 0.1); margin: 2px 0;'></div>", unsafe_allow_html=True)
