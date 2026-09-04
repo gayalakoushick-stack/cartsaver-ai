@@ -269,22 +269,20 @@ def get_analytics_summary():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Total carts
-    cursor.execute("SELECT COUNT(*) FROM carts")
-    total_carts = cursor.fetchone()[0] or 0
-
-    # Total cart value at risk
-    cursor.execute("SELECT SUM(cart_value) FROM carts")
-    total_value_at_risk = round(cursor.fetchone()[0] or 0.0, 2)
-
-    # Total value recovered
-    cursor.execute("SELECT SUM(cart_value) FROM carts WHERE recovered = 1")
-    total_value_recovered = round(cursor.fetchone()[0] or 0.0, 2)
-
-    # Count recovered
-    cursor.execute("SELECT COUNT(*) FROM carts WHERE recovered = 1")
-    recovered_count = cursor.fetchone()[0] or 0
-
+    # Consolidated portfolio totals (single SQL scan over table 'carts')
+    cursor.execute("""
+        SELECT 
+            COUNT(*),
+            COALESCE(SUM(cart_value), 0.0),
+            COALESCE(SUM(CASE WHEN recovered = 1 THEN cart_value ELSE 0.0 END), 0.0),
+            COALESCE(SUM(CASE WHEN recovered = 1 THEN 1 ELSE 0 END), 0)
+        FROM carts
+    """)
+    totals = cursor.fetchone()
+    total_carts = totals[0] or 0
+    total_value_at_risk = round(totals[1] or 0.0, 2)
+    total_value_recovered = round(totals[2] or 0.0, 2)
+    recovered_count = totals[3] or 0
     recovery_rate_percent = round((recovered_count / total_carts * 100), 2) if total_carts > 0 else 0.0
 
     # Segment breakdown
@@ -320,7 +318,7 @@ def get_analytics_summary():
             cat = "Low Recovery Score (< 0.15)"
         elif "Low cart value" in reason_str:
             cat = "Low Cart Value (< ₹300) & Low Score"
-        elif "Max 3 attempts" in reason_str:
+        elif "Max 3 attempts" in reason_str or "max attempts" in reason_str.lower():
             cat = "Max Attempts Exceeded"
         elif "already recovered" in reason_str.lower():
             cat = "Already Recovered"
@@ -328,6 +326,26 @@ def get_analytics_summary():
             cat = reason_str.split("(")[0].strip() if "(" in reason_str else reason_str
 
         stopping_reason_breakdown[cat] = stopping_reason_breakdown.get(cat, 0) + r['count']
+
+    # Fallback guardrail: If recovery_log has no stopping rule entries recorded,
+    # evaluate stopping rules dynamically across unrecovered carts in the database
+    if not stopping_reason_breakdown:
+        cursor.execute("SELECT * FROM carts WHERE recovered = 0")
+        unrecovered_carts = [dict(row) for row in cursor.fetchall()]
+        for cart_item in unrecovered_carts:
+            stop_trig, stop_reas = check_stopping_rules(cart_item, 1)
+            if stop_trig and stop_reas:
+                if "Low recovery score" in stop_reas:
+                    cat = "Low Recovery Score (< 0.15)"
+                elif "Low cart value" in stop_reas:
+                    cat = "Low Cart Value (< ₹300) & Low Score"
+                elif "Max 3 attempts" in stop_reas or "max attempts" in stop_reas.lower():
+                    cat = "Max Attempts Exceeded"
+                elif "already recovered" in stop_reas.lower():
+                    cat = "Already Recovered"
+                else:
+                    cat = stop_reas.split("(")[0].strip() if "(" in stop_reas else stop_reas
+                stopping_reason_breakdown[cat] = stopping_reason_breakdown.get(cat, 0) + 1
 
 
     # Escalation stage breakdown

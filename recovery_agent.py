@@ -80,14 +80,18 @@ def check_stopping_rules(cart, attempt_number):
     3. recovery_score < 0.15 (not worth contacting) -> Stop
     4. cart_value < 300 AND recovery_score < 0.40 (cost exceeds expected value) -> Stop
     """
-    if cart['recovered'] == 1:
+    if cart.get('recovered') == 1:
         return True, "Cart already recovered"
     if attempt_number > 3:
         return True, "Max 3 attempts per cart reached"
-    if cart['recovery_score'] < 0.15:
-        return True, f"Low recovery score ({cart['recovery_score']:.4f} < 0.15)"
-    if cart['cart_value'] < 300 and cart['recovery_score'] < 0.40:
-        return True, f"Low cart value (₹{cart['cart_value']:.2f} < ₹300) with low score ({cart['recovery_score']:.4f} < 0.40)"
+
+    rec_score = cart['recovery_score'] if cart.get('recovery_score') is not None else 0.0
+    c_val = cart['cart_value'] if cart.get('cart_value') is not None else 0.0
+
+    if rec_score < 0.15:
+        return True, f"Low recovery score ({rec_score:.4f} < 0.15)"
+    if c_val < 300 and rec_score < 0.40:
+        return True, f"Low cart value (₹{c_val:.2f} < ₹300) with low score ({rec_score:.4f} < 0.40)"
     return False, None
 
 def get_escalation_details(attempt_number, payment_method):
@@ -167,16 +171,17 @@ Respond in JSON format with exactly three string fields:
                     diag = data.get("root_cause_diagnosis", "Friction during payment authentication.")
                     draft = data.get("message_draft", f"Hi {cart['customer_name'].split()[0]}, tap to complete your order.")
                     reasoning = data.get("agent_reasoning", "Engaged customer with stage-appropriate messaging.")
+                    time.sleep(2)  # Delay between Gemini API calls to stay within free-tier rate limits
                     return diag, draft, reasoning, "gemini"
                 else:
                     last_error = "Gemini returned empty or invalid response text."
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                # If rate limited (429 / RESOURCE_EXHAUSTED), immediately use fallback without delaying the batch
+                # If rate limited (429 / RESOURCE_EXHAUSTED), wait briefly to allow quota recovery
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Quota exceeded" in err_str:
-                    break
-                if attempt_idx < max_retries:
+                    time.sleep(5)
+                elif attempt_idx < max_retries:
                     time.sleep(retry_delay)
                 else:
                     break
@@ -223,7 +228,8 @@ def simulate_outcome(cart, attempt_number):
     Escalation boost: Attempt 1 (+0.00), Attempt 2 (+0.02), Attempt 3 (+0.04)
     Target overall cumulative recovery rate: 20%–35%
     """
-    base_prob = cart['recovery_score'] * 0.15
+    rec_score = cart['recovery_score'] if cart.get('recovery_score') is not None else 0.0
+    base_prob = rec_score * 0.15
     boost = (attempt_number - 1) * 0.02
     effective_prob = min(0.40, base_prob + boost)
     
@@ -314,11 +320,11 @@ def run_recovery_workflow(limit=None):
     total_carts = len(carts)
     print(f"\nProcessing {total_carts} carts through Bounded Recovery Workflow (sorted by priority_score DESC)...", flush=True)
 
-    # Use ThreadPoolExecutor for fast parallel processing of Gemini calls
+    # Process carts sequentially to respect free-tier rate limits with 2s delay
     all_logs = []
     recovered_cart_ids = []
     
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=1) as executor:
         results = executor.map(process_cart, carts)
         for cart_logs, is_recovered, cart_id in results:
             all_logs.extend(cart_logs)
@@ -394,6 +400,7 @@ def run_recovery_workflow(limit=None):
     print("="*65 + "\n", flush=True)
 
     print_sample_audit_logs()
+    print_final_message_source_summary()
 
 def print_sample_audit_logs():
     conn = sqlite3.connect(DB_NAME)
@@ -422,6 +429,33 @@ def print_sample_audit_logs():
         print(f"  Message Draft     : {sample[6]}", flush=True)
         print(f"  Agent Reasoning   : {sample[7]}", flush=True)
         print(f"  Simulated Outcome : {sample[9]}", flush=True)
+    print("="*65 + "\n", flush=True)
+
+def print_final_message_source_summary():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT message_source, COUNT(*) 
+        FROM recovery_log 
+        WHERE message_source IN ('gemini', 'fallback') 
+        GROUP BY message_source
+    """)
+    counts = dict(cursor.fetchall())
+    conn.close()
+
+    gemini_count = counts.get("gemini", 0)
+    fallback_count = counts.get("fallback", 0)
+    total_messages = gemini_count + fallback_count
+
+    gemini_pct = (gemini_count / total_messages * 100.0) if total_messages > 0 else 0.0
+    fallback_pct = (fallback_count / total_messages * 100.0) if total_messages > 0 else 0.0
+
+    print("="*65, flush=True)
+    print("             FINAL MESSAGE SOURCE COUNT SUMMARY              ", flush=True)
+    print("="*65, flush=True)
+    print(f"Total Log Entries (Contact Messages): {total_messages}", flush=True)
+    print(f"  • message_source == 'gemini'   : {gemini_count:>5} ({gemini_pct:5.1f}%)", flush=True)
+    print(f"  • message_source == 'fallback' : {fallback_count:>5} ({fallback_pct:5.1f}%)", flush=True)
     print("="*65 + "\n", flush=True)
 
 def main():

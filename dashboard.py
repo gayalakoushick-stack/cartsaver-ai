@@ -1,12 +1,34 @@
 import os
 import sys
 import json
+import time
+import sqlite3
+import subprocess
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
 import streamlit as st
 import requests
 import plotly.graph_objects as go
+
+# Ensure UTF-8 stdout encoding on Windows console to prevent charmap UnicodeEncodeError
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            getattr(sys.stdout, "reconfigure")(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+def safe_log(message: str):
+    """Safely print debug messages to stdout handling Windows charmap/cp1252 encoding."""
+    try:
+        print(message, flush=True)
+    except (UnicodeEncodeError, Exception):
+        try:
+            safe_msg = message.encode("ascii", errors="backslashreplace").decode("ascii")
+            print(safe_msg, flush=True)
+        except Exception:
+            pass
 
 # -----------------------------------------------------------------------------
 # CONSTANTS & CONFIGURATION
@@ -220,11 +242,12 @@ div.stButton > button[kind="primary"]:hover {{
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# ROBUST API CLIENT
+# ROBUST API CLIENT WITH STREAMLIT DATA CACHING (ttl=30s)
 # Wraps every request in a try/except block, checks response.status_code == 200,
 # and returns (parsed_json, None) on success or (None, error_str) on failure.
+# Caches GET requests with @st.cache_data(ttl=30) to eliminate redundant calls.
 # -----------------------------------------------------------------------------
-def fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+def _raw_fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
     url = f"{BACKEND_BASE_URL}{endpoint}"
     try:
         if method == "GET":
@@ -241,10 +264,58 @@ def fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any
                 return None, f"Failed to parse JSON response from {endpoint}: {parse_err}"
         else:
             return None, f"Backend returned HTTP {response.status_code} for {endpoint}: {response.text}"
-    except requests.exceptions.RequestException as e:
+    except requests.exceptions.RequestException:
         return None, f"Unable to reach CartSaver AI backend at {BACKEND_BASE_URL}. Please verify the FastAPI service is running."
     except Exception as e:
         return None, f"Unexpected error during API call to {endpoint}: {e}"
+
+@st.cache_data(ttl=30)
+def fetch_analytics_summary() -> Tuple[Optional[Any], Optional[str]]:
+    """Fetch portfolio analytics summary with 30s TTL caching."""
+    return _raw_fetch_api("/analytics/summary")
+
+@st.cache_data(ttl=30)
+def fetch_carts(params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    """Fetch carts list with optional query filters and 30s TTL caching."""
+    return _raw_fetch_api("/carts", params=params)
+
+@st.cache_data(ttl=30)
+def fetch_audit_log(limit: int = 50, offset: int = 0) -> Tuple[Optional[Any], Optional[str]]:
+    """Fetch paginated audit log entries with 30s TTL caching."""
+    return _raw_fetch_api("/audit-log", params={"limit": limit, "offset": offset})
+
+@st.cache_data(ttl=30)
+def fetch_cart_detail(cart_id: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Fetch individual cart details and escalation logs with 30s TTL caching."""
+    return _raw_fetch_api(f"/carts/{cart_id}")
+
+@st.cache_data(ttl=30)
+def _cached_get_api(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    """Fallback cached GET dispatcher with 30s TTL caching."""
+    return _raw_fetch_api(endpoint, method="GET", params=params)
+
+def fetch_api(endpoint: str, method: str = "GET", params: Optional[Dict[str, Any]] = None, json_data: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Central API gateway:
+    - Routes GET calls (/analytics/summary, /carts, /audit-log, /carts/{id}) to 30s cached functions.
+    - Routes POST requests (e.g. recovery actions) live without caching.
+    """
+    if method == "GET":
+        if endpoint == "/analytics/summary":
+            return fetch_analytics_summary()
+        elif endpoint == "/carts":
+            return fetch_carts(params=params)
+        elif endpoint == "/audit-log":
+            limit = params.get("limit", 50) if params else 50
+            offset = params.get("offset", 0) if params else 0
+            return fetch_audit_log(limit=limit, offset=offset)
+        elif endpoint.startswith("/carts/"):
+            cid = endpoint.split("/carts/")[1]
+            return fetch_cart_detail(cid)
+        else:
+            return _cached_get_api(endpoint, params=params)
+    else:
+        return _raw_fetch_api(endpoint, method=method, json_data=json_data)
 
 # -----------------------------------------------------------------------------
 # SESSION STATE INITIALIZATION
@@ -343,15 +414,96 @@ st.markdown("<div style='border-bottom: 1px solid rgba(102, 112, 133, 0.2); marg
 # PAGE 1: OVERVIEW
 # -----------------------------------------------------------------------------
 if st.session_state.page == "Overview":
-    st.markdown(
-        """
-        <div style="margin-bottom: 22px;">
-            <div style="font-size: 22px; font-weight: 700; color: var(--text-color); margin-bottom: 4px;">Portfolio Overview</div>
-            <div style="font-size: 14px; color: var(--text-color); opacity: 0.7;">Autonomous recovery insights and high-level risk engine telemetry.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    overview_col_left, overview_col_right = st.columns([3.2, 1.8])
+
+    with overview_col_left:
+        st.markdown(
+            """
+            <div style="margin-bottom: 18px;">
+                <div style="font-size: 22px; font-weight: 700; color: var(--text-color); margin-bottom: 4px;">Portfolio Overview</div>
+                <div style="font-size: 14px; color: var(--text-color); opacity: 0.7;">Autonomous recovery insights and high-level risk engine telemetry.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with overview_col_right:
+        run_pipeline = st.button("Run Full Pipeline", key="btn_run_pipeline", type="primary", use_container_width=True)
+        st.markdown(
+            """
+            <div style="font-size: 11px; color: var(--text-color); opacity: 0.65; margin-top: 4px; line-height: 1.25; text-align: right;">
+                This regenerates all cart data and will take 10-15 minutes.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if run_pipeline:
+        workspace_dir = os.path.dirname(os.path.abspath(__file__))
+        python_bin = sys.executable
+
+        steps = [
+            ("Generating cart data...", "generate_carts.py"),
+            ("Scoring and prioritizing...", "score_carts.py"),
+            ("Running recovery agent...", "recovery_agent.py"),
+        ]
+
+        pipeline_failed = False
+        with st.status("Running full pipeline...", expanded=True) as status:
+            for step_label, script_name in steps:
+                st.write(step_label)
+                script_path = os.path.join(workspace_dir, script_name)
+                try:
+                    proc = subprocess.run(
+                        [python_bin, script_path],
+                        cwd=workspace_dir,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace"
+                    )
+                    if proc.returncode != 0:
+                        pipeline_failed = True
+                        status.update(label=f"Pipeline failed at step: {script_name}", state="error", expanded=True)
+                        st.error(f"Error executing {script_name} (Exit code: {proc.returncode})")
+                        err_detail = proc.stderr.strip() if proc.stderr else proc.stdout.strip()
+                        if err_detail:
+                            st.code(err_detail, language="bash")
+                        break
+                except Exception as exc:
+                    pipeline_failed = True
+                    status.update(label=f"Pipeline error running {script_name}", state="error", expanded=True)
+                    st.error(f"Failed to launch {script_name}: {exc}")
+                    break
+
+            if not pipeline_failed:
+                final_rec_rate = None
+                try:
+                    db_path = os.path.join(workspace_dir, "cartsaver.db")
+                    conn = sqlite3.connect(db_path)
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*), SUM(CASE WHEN recovered = 1 THEN 1 ELSE 0 END) FROM carts")
+                    r = cur.fetchone()
+                    conn.close()
+                    if r and r[0] and r[0] > 0:
+                        final_rec_rate = (r[1] / r[0]) * 100.0
+                except Exception as db_err:
+                    safe_log(f"[DEBUG] Error querying recovery rate after pipeline: {db_err}")
+
+                if final_rec_rate is not None:
+                    success_msg = f"Pipeline complete — Final Recovery Rate: {final_rec_rate:.2f}%"
+                else:
+                    success_msg = "Pipeline complete"
+
+                status.update(label=success_msg, state="complete", expanded=False)
+                st.success(success_msg)
+                st.session_state.flash_message = {
+                    "type": "success",
+                    "text": success_msg
+                }
+                time.sleep(1.0)
+                st.cache_data.clear()
+                st.rerun()
 
     # Use summary fetched in header if available, otherwise fetch
     summary_data, summary_err = (header_summary, header_err) if header_summary is not None else fetch_api("/analytics/summary")
@@ -485,41 +637,159 @@ if st.session_state.page == "Overview":
                 st.plotly_chart(fig_stage, use_container_width=True, config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Chart 3: Donut chart of stopping_reason_breakdown
+    # Chart 3: Donut chart of stopping_reason_breakdown / Agent Stopping Rules
     st.markdown("<div class='cs-card'>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size: 15px; font-weight: 600; margin-bottom: 12px;'>Stopping Rule Trigger Distribution</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size: 15px; font-weight: 600; margin-bottom: 12px;'>Agent Stopping Rules Distribution</div>", unsafe_allow_html=True)
     
-    if not summary_data or not isinstance(summary_data, dict) or "stopping_reason_breakdown" not in summary_data:
-        st.error("Stopping reason breakdown data is currently unavailable.")
-    else:
-        stop_data = summary_data.get("stopping_reason_breakdown", {})
-        if not isinstance(stop_data, dict) or len(stop_data) == 0:
-            st.info("No stopping rule triggers recorded.")
+    # 1. Read stopping_reason_breakdown with fallback to alternative keys
+    raw_stop_data = None
+    if isinstance(summary_data, dict):
+        for key_candidate in [
+            "stopping_reason_breakdown",
+            "stopping_reasons",
+            "stopping_rules",
+            "stopping_rule_breakdown",
+            "agent_stopping_rules"
+        ]:
+            if key_candidate in summary_data and summary_data[key_candidate] is not None:
+                raw_stop_data = summary_data[key_candidate]
+                break
+
+    # Debug print to console as requested
+    safe_log(f"[DEBUG] Raw stopping_reason_breakdown data passed to donut chart: {raw_stop_data}")
+
+    def _normalize_stop_category(name: Any) -> str:
+        s = str(name).strip()
+        s_lower = s.lower()
+        if "low recovery score" in s_lower:
+            return "Low Recovery Score (< 0.15)"
+        elif "low cart value" in s_lower:
+            return "Low Cart Value (< ₹300) & Low Score"
+        elif "max 3 attempts" in s_lower or "max attempts" in s_lower:
+            return "Max Attempts Exceeded"
+        elif "already recovered" in s_lower:
+            return "Already Recovered"
+        elif "(" in s:
+            return s.split("(")[0].strip()
+        return s
+
+    # 2. Robust normalization of category keys and counts across multiple data shapes
+    normalized_stop_data: Dict[str, int] = {}
+    if isinstance(raw_stop_data, dict):
+        # Handle case where dict has separate "labels"/"reasons" and "values"/"counts" keys
+        if ("labels" in raw_stop_data or "reasons" in raw_stop_data) and ("values" in raw_stop_data or "counts" in raw_stop_data):
+            labels_list = raw_stop_data.get("labels") or raw_stop_data.get("reasons") or []
+            values_list = raw_stop_data.get("values") or raw_stop_data.get("counts") or []
+            for lab, val in zip(labels_list, values_list):
+                cat = _normalize_stop_category(lab)
+                cnt = 0
+                if val is not None:
+                    try:
+                        cnt = int(val)
+                    except (ValueError, TypeError):
+                        cnt = 0
+                if cnt > 0:
+                    normalized_stop_data[cat] = normalized_stop_data.get(cat, 0) + cnt
         else:
-            stop_reasons = list(stop_data.keys())
-            stop_counts = [stop_data.get(r, 0) for r in stop_reasons]
+            for k, v in raw_stop_data.items():
+                cat = _normalize_stop_category(k)
+                cnt = 0
+                if isinstance(v, dict):
+                    raw_val = v.get("count", v.get("value", v.get("total", 0)))
+                else:
+                    raw_val = v
+                if raw_val is not None:
+                    try:
+                        cnt = int(raw_val)
+                    except (ValueError, TypeError):
+                        cnt = 0
+                if cnt > 0:
+                    normalized_stop_data[cat] = normalized_stop_data.get(cat, 0) + cnt
+    elif isinstance(raw_stop_data, list):
+        for item in raw_stop_data:
+            if isinstance(item, dict):
+                label = (
+                    item.get("reason")
+                    or item.get("category")
+                    or item.get("label")
+                    or item.get("name")
+                    or item.get("stopping_reason")
+                    or "Other"
+                )
+                cat = _normalize_stop_category(label)
+                raw_val = item.get("count", item.get("value", item.get("total", 1)))
+                cnt = 1
+                if raw_val is not None:
+                    try:
+                        cnt = int(raw_val)
+                    except (ValueError, TypeError):
+                        cnt = 1
+                if cnt > 0:
+                    normalized_stop_data[cat] = normalized_stop_data.get(cat, 0) + cnt
+            elif isinstance(item, str):
+                cat = _normalize_stop_category(item)
+                normalized_stop_data[cat] = normalized_stop_data.get(cat, 0) + 1
 
-            stop_palette = [ACCENT_COLOR, "#875BF7", "#B39BF7", "#D6BBFB", "#98A2B3", "#667085"]
+    safe_log(f"[DEBUG] Normalized stopping reason categories with counts: {normalized_stop_data}")
 
-            fig_donut = go.Figure()
-            fig_donut.add_trace(go.Pie(
-                labels=stop_reasons,
-                values=stop_counts,
-                hole=0.6,
-                marker=dict(colors=stop_palette[:len(stop_reasons)]),
-                textinfo="label+percent",
-                hovertemplate="<b>%{label}</b><br>Count: %{value} (%{percent})<extra></extra>"
-            ))
-            fig_donut.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=10, b=20, l=20, r=20),
-                font=dict(family="Inter", size=12, color="#667085"),
-                showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
-                height=320
-            )
-            st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+    if not normalized_stop_data:
+        st.info("No stopping rule triggers recorded.")
+    else:
+        stop_reasons = list(normalized_stop_data.keys())
+        stop_counts = [normalized_stop_data[r] for r in stop_reasons]
+        total_stopped = sum(stop_counts)
+
+        stop_palette = [
+            ACCENT_COLOR, "#875BF7", "#9E77ED", "#B39BF7",
+            "#D6BBFB", "#7F56D9", "#667085", "#98A2B3"
+        ]
+        slice_colors = [stop_palette[i % len(stop_palette)] for i in range(len(stop_reasons))]
+        legend_labels = [f"{r} ({cnt})" for r, cnt in zip(stop_reasons, stop_counts)]
+
+        fig_donut = go.Figure()
+        fig_donut.add_trace(go.Pie(
+            labels=legend_labels,
+            values=stop_counts,
+            hole=0.6,
+            marker=dict(colors=slice_colors),
+            textinfo="label+percent",
+            hovertemplate="<b>%{label}</b><br>Count: %{value}<br>Proportion: %{percent}<extra></extra>"
+        ))
+        fig_donut.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=20, l=20, r=20),
+            font=dict(family="Inter", size=12, color="#667085"),
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=-0.25,
+                xanchor="center",
+                x=0.5,
+                font=dict(size=11)
+            ),
+            height=330,
+            annotations=[
+                dict(
+                    text=f"<b>{total_stopped}</b><br><span style='font-size:10px; color:#667085;'>STOPPED</span>",
+                    x=0.5, y=0.5,
+                    font_size=15,
+                    showarrow=False
+                )
+            ]
+        )
+        st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+
+        # Category pill summary showing stopping reason categories with counts
+        pills_html = "".join([
+            f'<div style="display: inline-flex; align-items: center; background: rgba(105, 56, 239, 0.08); border: 1px solid rgba(105, 56, 239, 0.2); border-radius: 16px; padding: 4px 12px; margin: 4px 6px 4px 0; font-size: 12px; color: var(--text-color);">'
+            f'<span style="font-weight: 500;">{reason}</span>'
+            f'<span style="margin-left: 8px; background: {ACCENT_COLOR}; color: #ffffff; font-weight: 700; border-radius: 10px; padding: 1px 7px; font-size: 11px;">{count}</span>'
+            f'</div>'
+            for reason, count in normalized_stop_data.items()
+        ])
+        st.markdown(f"<div style='margin-top: 10px;'>{pills_html}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -757,6 +1027,7 @@ elif st.session_state.page == "Carts Explorer":
                                     "type": "info",
                                     "text": f"Attempt for {cname} executed at {stage}. Outcome: {outcome}."
                                 }
+                    st.cache_data.clear()
                     st.rerun()
 
             st.markdown("<div style='border-bottom: 1px solid rgba(102, 112, 133, 0.1); margin: 2px 0;'></div>", unsafe_allow_html=True)
