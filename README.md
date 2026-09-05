@@ -48,14 +48,20 @@ This is intentional: the right tool for each part of the problem, not "LLM does 
 
 ---
 
-## Architecture
+## Architecture Flow
+
+![CartSaver AI Architecture Flow](image.png)
 
 ```
-generate_carts.py   ->  synthetic cart data                        ->  cartsaver.db
-score_carts.py       ->  recovery_score + segment (scikit-learn)     ->  cartsaver.db
-recovery_agent.py    ->  root cause -> escalation -> stop -> log (Gemini)  ->  recovery_log
-main.py               ->  FastAPI REST layer over cartsaver.db
+generate_carts.py    ->  Synthetic cart data                        ->  cartsaver.db
+score_carts.py       ->  Recovery scoring & segmentation (sklearn)   ->  cartsaver.db
+recovery_agent.py    ->  Root cause diagnosis & recovery (Gemini)    ->  cartsaver.db
+simulate_webhook.py  ->  Signed Razorpay test webhook payloads       ->  main.py
+main.py              ->  FastAPI REST API layer over cartsaver.db    ->  dashboard.py
+dashboard.py         ->  Streamlit interactive analytics UI
 ```
+
+---
 
 ## Tech Stack
 
