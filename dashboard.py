@@ -301,6 +301,34 @@ if st.session_state.flash_message:
     st.session_state.flash_message = None
 
 # -----------------------------------------------------------------------------
+# BACKEND WAKE-UP PING (Handles Render free-tier sleep mode gracefully)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def ping_backend(base_url: str) -> bool:
+    """Ping /health or root endpoint with a 15-second timeout to wake up Render free-tier backend."""
+    clean_base = base_url.rstrip("/")
+    for endpoint in ["/health", "/"]:
+        try:
+            resp = requests.get(f"{clean_base}{endpoint}", timeout=15)
+            if resp.status_code == 200:
+                return True
+        except requests.exceptions.RequestException:
+            continue
+        except Exception:
+            continue
+    return False
+
+with st.spinner("Connecting to CartSaver AI Secure Backend... (Waking up server if inactive)"):
+    backend_is_online = ping_backend(BACKEND_BASE_URL)
+
+if not backend_is_online:
+    ping_backend.clear()
+    st.warning(
+        "CartSaver AI backend is taking longer than expected to respond (Render free-tier spin-up). "
+        "The server may still be booting up. Please allow up to a minute and refresh the page."
+    )
+
+# -----------------------------------------------------------------------------
 # TOP HEADER BAR
 # "CartSaver AI" name on the left.
 # Three nav items (Overview, Carts Explorer, Audit Trail) as buttons using st.session_state.page.
